@@ -1,0 +1,216 @@
+-- farmer.lua (home-relative deposit: back 2 from go_dir)
+-- Slot 1: placing blocks only; Slots 2..16: harvested output
+
+--------------------- CONFIG ------------------------
+local STATE_FILE = "farmer_state.json"
+local CLEAR_ON_RESUME = true
+local WAIT_POLL_SEC = 2
+local TAKE_COUNT = 8
+
+------------------- STATE / LOAD --------------------
+local state = {
+  x = 0, z = 0, dir = 0,   -- dir: 0=N,1=E,2=S,3=W
+  go_dir = nil,
+  resumed = false
+}
+
+local function save()
+  local f = fs.open(STATE_FILE, "w")
+  f.write(textutils.serializeJSON(state))
+  f.close()
+end
+
+local function load()
+  if not fs.exists(STATE_FILE) then save() return false end
+  local ok, data = pcall(function()
+    local f = fs.open(STATE_FILE, "r")
+    local t = textutils.unserializeJSON(f.readAll())
+    f.close(); return t
+  end)
+  if ok and data and data.x and data.z and data.dir then
+    state = data; state.resumed = true; return true
+  end
+  save(); return false
+end
+
+------------------ MOVEMENT CORE --------------------
+local function fwd()
+  if not turtle.forward() then
+    turtle.dig(); turtle.attack(); sleep(0.1)
+    if not turtle.forward() then error("blocked forward") end
+  end
+end
+
+local function sfwd(n)
+  for _=1,(n or 1) do
+    fwd()
+    if state.dir == 0 then state.z = state.z - 1
+    elseif state.dir == 1 then state.x = state.x + 1
+    elseif state.dir == 2 then state.z = state.z + 1
+    else state.x = state.x - 1 end
+    save()
+  end
+end
+
+local function sl() turtle.turnLeft();  state.dir = (state.dir + 3) % 4; save() end
+local function sr() turtle.turnRight(); state.dir = (state.dir + 1) % 4; save() end
+
+local function face(d)
+  local t = (d - state.dir) % 4
+  if t == 1 then sr()
+  elseif t == 2 then sr(); sr()
+  elseif t == 3 then sl()
+  end
+end
+
+-- Robust back step that preserves heading and updates coordinates
+local function safeBack(n)
+  for _=1,(n or 1) do
+    if turtle.back() then
+      if state.dir == 0 then state.z = state.z + 1
+      elseif state.dir == 1 then state.x = state.x - 1
+      elseif state.dir == 2 then state.z = state.z - 1
+      else state.x = state.x + 1 end
+      save()
+    else
+      -- turn around, clear forward, move, restore heading
+      sr(); sr()
+      state.dir = (state.dir + 2) % 4; save()
+      if not turtle.forward() then
+        turtle.dig(); turtle.attack(); sleep(0.1)
+        if not turtle.forward() then
+          sr(); sr()
+          state.dir = (state.dir + 2) % 4; save()
+          error("blocked back")
+        end
+      end
+      -- We moved 1 block in the opposite direction of original "back", so update as a back step:
+      -- After the two turns we are facing opposite; movement was "forward" in opposite,
+      -- equivalent to "back" in original frame:
+      if state.dir == 0 then       -- currently opposite; original unknown, but this math is easier if we restore now
+        -- do nothing here; we’ll restore heading then update pos relative to restored dir
+      end
+      -- Restore heading
+      sr(); sr()
+      state.dir = (state.dir + 2) % 4; save()
+      -- Now update as a back step relative to restored heading:
+      if state.dir == 0 then state.z = state.z + 1
+      elseif state.dir == 1 then state.x = state.x - 1
+      elseif state.dir == 2 then state.z = state.z - 1
+      else state.x = state.x + 1 end
+      save()
+    end
+  end
+end
+
+local function goto(x,z)
+  local dx, dz = x - state.x, z - state.z
+  if dx ~= 0 then face(dx>0 and 1 or 3); sfwd(math.abs(dx)) end
+  if dz ~= 0 then face(dz>0 and 2 or 0); sfwd(math.abs(dz)) end
+end
+
+local function goHome()
+  goto(0,0)
+  face(state.go_dir or 0)
+end
+
+------------------- UTILITIES -----------------------
+local function waitCropChange(before)
+  while true do
+    local ok, d = turtle.inspectDown()
+    if (ok and d.name or "none") ~= before then return end
+    sleep(WAIT_POLL_SEC)
+  end
+end
+
+local function selectSlot1() if turtle.getSelectedSlot() ~= 1 then turtle.select(1) end end
+
+----------------- IN / OUT MOTIONS ------------------
+-- Intake only into slot 1 (supply chest down, 1 step right of home)
+local function intake()
+  sr()
+  sfwd(1)
+  turtle.select(1)
+  turtle.suckDown(TAKE_COUNT)
+  sl(); sl()
+  sfwd(1)
+  sr()
+end
+
+-- Placement walker (8 cells) – same as before
+local function walkPlacementShape(cb)
+  sfwd(2); cb()
+  sfwd(1); cb()
+  sl(); sfwd(1); cb()
+  sfwd(1); cb()
+  sl(); sfwd(1); cb()
+  sfwd(1); cb()
+  sl(); sfwd(1); cb()
+  sfwd(1); cb()
+end
+
+local function placement()
+  selectSlot1()
+  walkPlacementShape(function() selectSlot1(); turtle.placeDown() end)
+end
+
+-- Harvest along footprint, stopping at pre-deposit position (same as before)
+local function harvestPathToEnd()
+  turtle.digDown()
+  sl(); sfwd(1); turtle.digDown()
+  sfwd(1); turtle.digDown()
+  sl(); sfwd(1); turtle.digDown()
+  sfwd(1); turtle.digDown()
+  sl(); sfwd(1); turtle.digDown()
+  sfwd(1)
+  -- stop; we'll now go home for deposit
+end
+
+-- Deposit: always go HOME, face go_dir, then BACK 2 and drop slots 2..16 DOWN.
+local function depositAtHomeBack2()
+  goHome()
+  -- face(state.go_dir) already ensured
+  safeBack(2)                   -- move to the deposit position behind home
+  for s = 2, 16 do
+    if turtle.getItemCount(s) > 0 then
+      turtle.select(s)
+      turtle.dropDown(turtle.getItemCount(s))
+    end
+  end
+  turtle.select(1)
+  -- return to home
+  sfwd(2)
+  goHome()
+end
+
+------------------- TARGETED CLEAR ------------------
+local function clearField()
+  goHome()
+  walkPlacementShape(function() turtle.digDown() end)
+  goHome()
+end
+
+------------------- STARTUP -------------------------
+local resumed = load()
+if not state.go_dir then state.go_dir = state.dir; save() end
+
+goHome()
+face(state.go_dir)
+
+if resumed and CLEAR_ON_RESUME then
+  clearField()
+  state.resumed = false; save()
+end
+
+------------------- MAIN LOOP -----------------------
+while true do
+  intake()
+  placement()
+
+  local ok, d = turtle.inspectDown()
+  waitCropChange((ok and d.name) or "none")
+
+  harvestPathToEnd()
+  depositAtHomeBack2()
+  goHome()
+end
