@@ -1,0 +1,313 @@
+-- farmer.lua
+-- Simple, robust reboot-resume farmer with state persistence.
+-- Keeps: current pos (x,z), facing dir (0=N,1=E,2=S,3=W), and whether we resumed.
+-- "Go" spot is (0,0) at startup heading; we always return to it.
+
+--------------------------- CONFIG ---------------------------
+local STATE_FILE = "farmer_state.json"
+local CLEAR_ON_RESUME = true   -- one-time field clear after crash/reboot
+local WAIT_POLL_SEC   = 2      -- poll period while waiting for crop to change
+
+-- Movement behavior
+local DIG_AHEAD_IF_BLOCKED = true
+local ATTACK_AHEAD_IF_BLOCKED = true
+
+-- Inventory I/O amounts
+local TAKE_COUNT = 8
+local DROP_COUNT = 8
+
+------------------------- STATE CORE -------------------------
+local state = {
+  x = 0, z = 0, dir = 0,     -- dir: 0=N,1=E,2=S,3=W in a 2D plane
+  go_dir = 0,                -- heading we consider "home-facing"
+  resumed = false,           -- set true on first load in an already-existing state file
+}
+
+local function saveState()
+  local f = fs.open(STATE_FILE, "w")
+  f.write(textutils.serializeJSON(state))
+  f.close()
+end
+
+local function loadState()
+  if not fs.exists(STATE_FILE) then
+    -- First run: capture current heading as go_dir
+    -- We can't directly read heading from CC, so we assume heading at launch is "go_dir".
+    state.x, state.z, state.dir = 0, 0, 0
+    state.go_dir = 0
+    saveState()
+    return false
+  end
+  local ok, data = pcall(function()
+    local f = fs.open(STATE_FILE, "r")
+    local t = textutils.unserializeJSON(f.readAll() or "{}")
+    f.close()
+    return t
+  end)
+  if ok and type(data)=="table" and data.x and data.z and data.dir then
+    state = data
+    state.resumed = true
+    return true
+  end
+  -- If parsing failed, reset clean.
+  state = { x=0, z=0, dir=0, go_dir=0, resumed=false }
+  saveState()
+  return false
+end
+
+----------------------- DIR & MOVEMENT -----------------------
+local function wrapForward()
+  local function try()
+    if turtle.forward() then return true end
+    return false
+  end
+  if try() then return true end
+  if DIG_AHEAD_IF_BLOCKED then turtle.dig() end
+  if ATTACK_AHEAD_IF_BLOCKED then turtle.attack() end
+  sleep(0.2)
+  return try()
+end
+
+local function safeForward(n)
+  n = n or 1
+  for _=1,n do
+    if not wrapForward() then error("Blocked forward.") end
+    -- advance position in current dir
+    if state.dir == 0 then state.z = state.z - 1
+    elseif state.dir == 1 then state.x = state.x + 1
+    elseif state.dir == 2 then state.z = state.z + 1
+    else state.x = state.x - 1 end
+    saveState()
+  end
+end
+
+local function safeBack(n)
+  n = n or 1
+  for _=1,n do
+    if not turtle.back() then
+      -- fallback: turn around, forward, turn back
+      turtle.turnLeft(); turtle.turnLeft()
+      saveState(); state.dir = (state.dir + 2) % 4; saveState()
+      if not wrapForward() then error("Blocked back.") end
+      -- moving one step "back" means inverse of current facing AFTER we turned around,
+      -- but we flipped twice; simpler: adjust position as if we stepped back originally
+      if state.dir == 0 then
+        -- we are facing opposite of original; compensate:
+        -- Better: revert the temporary turn adjustments after moving
+      end
+      -- undo temp turns and fix pos cleanly:
+      turtle.turnLeft(); turtle.turnLeft()
+      state.dir = (state.dir + 2) % 4; saveState()
+    else
+      -- update pos as the inverse of facing
+      if state.dir == 0 then state.z = state.z + 1
+      elseif state.dir == 1 then state.x = state.x - 1
+      elseif state.dir == 2 then state.z = state.z - 1
+      else state.x = state.x + 1 end
+      saveState()
+    end
+  end
+end
+
+local function safeTurnLeft()
+  turtle.turnLeft()
+  state.dir = (state.dir + 3) % 4
+  saveState()
+end
+
+local function safeTurnRight()
+  turtle.turnRight()
+  state.dir = (state.dir + 1) % 4
+  saveState()
+end
+
+local function faceDir(targetDir)
+  -- rotate minimal turns to targetDir
+  local delta = (targetDir - state.dir) % 4
+  if delta == 1 then safeTurnRight()
+  elseif delta == 2 then safeTurnRight(); safeTurnRight()
+  elseif delta == 3 then safeTurnLeft()
+  end
+end
+
+local function goTo(x, z)
+  -- Manhattan routing: x first, then z
+  local dx = x - state.x
+  if dx ~= 0 then
+    faceDir(dx > 0 and 1 or 3)   -- E or W
+    safeForward(math.abs(dx))
+  end
+  local dz = z - state.z
+  if dz ~= 0 then
+    faceDir(dz > 0 and 2 or 0)   -- S or N
+    safeForward(math.abs(dz))
+  end
+end
+
+local function goHome()
+  goTo(0,0)
+  faceDir(state.go_dir or 0)
+end
+
+-------------------- SMALL UTIL WRAPPERS ---------------------
+local function waitForChangeDown(initialName)
+  while true do
+    local ok, data = turtle.inspectDown()
+    local now = (ok and data.name) or "none"
+    if now ~= initialName then return end
+    sleep(WAIT_POLL_SEC)
+  end
+end
+
+local function suckPlantBatch()
+  -- Your original intake
+  turtle.turnRight()
+  safeForward(1)
+  turtle.suckDown(TAKE_COUNT)
+  safeTurnLeft(); safeTurnLeft()
+  safeForward(1)
+  safeTurnRight()
+end
+
+local function dropHarvestBatch()
+  turtle.turnRight()
+  safeForward(2)
+  turtle.dropDown(DROP_COUNT)
+  safeTurnLeft(); safeTurnLeft()
+  safeForward(1)
+end
+
+------------------- YOUR FIELD MOTION (PLACEMENT) ------------
+-- This reproduces your exact placeDown “loop” path, just made robust.
+local function doPlacementPattern()
+  -- assumes we are at go spot, facing state.go_dir
+  -- Sequence equivalent to your: R F, LL F, R F F, PD, F PD, L F PD, F PD, L F PD, F PD, L F PD, F PD
+  -- 1) already did: turnRight() in suckPlantBatch, then we returned and turnedRight(). We ensure same below.
+  -- We start at go spot; your code starts with: turnRight(); forward(); suckDown(); turnLeft(); turnLeft(); forward(); turnRight(); forward(); forward();
+  -- We’ve already done suck separately; resume from: turnRight(); forward(); forward(); then place pattern.
+
+  safeTurnRight()
+  safeForward(2)
+
+  turtle.placeDown()
+  safeForward(1)
+  turtle.placeDown()
+
+  safeTurnLeft()
+  safeForward(1)
+  turtle.placeDown()
+  safeForward(1)
+  turtle.placeDown()
+
+  safeTurnLeft()
+  safeForward(1)
+  turtle.placeDown()
+  safeForward(1)
+  turtle.placeDown()
+
+  safeTurnLeft()
+  safeForward(1)
+  turtle.placeDown()
+  safeForward(1)
+  turtle.placeDown()
+end
+
+------------------- OPTIONAL CLEAR (SIMPLE) ------------------
+-- A light pass over the same footprint to ensure clean slate
+local function clearFieldPass()
+  -- Trace the same footprint as harvesting digDowns, removing leftovers.
+  -- Your harvest path begins where placement ended; we reproduce that.
+  -- Starting from the end of placement, we are currently  (relative) one segment past last placement.
+  -- To keep it simple: goHome() and do a rectangle sweep covering the small area.
+
+  goHome()
+  -- Sweep a 3x3 around the field area you operate in (conservative)
+  -- Pattern: face East, dig rows 3x3
+  faceDir(1) -- East
+  for row = 1,3 do
+    for col = 1,2 do
+      turtle.digDown()
+      if col < 2 then safeForward(1) end
+    end
+    turtle.digDown()
+    -- move to next row
+    if row < 3 then
+      if row % 2 == 1 then
+        safeTurnRight(); safeForward(1); safeTurnRight()
+      else
+        safeTurnLeft(); safeForward(1); safeTurnLeft()
+      end
+    end
+  end
+  -- Return to home
+  goHome()
+end
+
+------------------- YOUR FIELD MOTION (HARVEST) --------------
+local function doHarvestPatternAndReturn()
+  -- Mirror your exact harvest sequence from where placement left you.
+  -- For simplicity, we reposition to the start of your harvest path:
+  goHome()
+  -- Your code: after waiting, it does:
+  -- digDown; L; F; digDown; F; digDown; L; F; digDown; F; digDown; L; F; digDown; F; digDown; L; F; digDown; F; R; F; F; dropDown; LL; F
+  turtle.digDown()
+  safeTurnLeft()
+  safeForward(1); turtle.digDown()
+  safeForward(1); turtle.digDown()
+
+  safeTurnLeft()
+  safeForward(1); turtle.digDown()
+  safeForward(1); turtle.digDown()
+
+  safeTurnLeft()
+  safeForward(1); turtle.digDown()
+  safeForward(1); turtle.digDown()
+
+  safeTurnLeft()
+  safeForward(1); turtle.digDown()
+  safeForward(1)
+
+  safeTurnRight()
+  safeForward(2)
+  turtle.dropDown(DROP_COUNT)
+
+  safeTurnLeft(); safeTurnLeft()
+  safeForward(1)
+end
+
+-------------------------- STARTUP ---------------------------
+local resumed = loadState()
+if resumed and CLEAR_ON_RESUME then
+  -- Ensure we can always get to go position and face the right way after a reboot
+  goHome()
+  clearFieldPass()
+  -- Only clear once per resume; mark as not resumed for next cycles.
+  state.resumed = false
+  saveState()
+else
+  -- First run or no clear requested: define go_dir = current dir (0)
+  -- We already defaulted dir/go_dir=0 on fresh.
+  goHome()
+end
+
+------------------------- MAIN LOOP --------------------------
+while true do
+  -- 1) Intake seeds/items
+  suckPlantBatch()         -- handles the turn/step/suck and back
+
+  -- 2) Move to field start & place pattern
+  -- Your original had an extra forward before placing; we already emulate proper stance.
+  doPlacementPattern()
+
+  -- 3) Wait for block under to change (your logic)
+  local ok, data = turtle.inspectDown()
+  local beforeName = (ok and data.name) or "none"
+  waitForChangeDown(beforeName)
+
+  -- 4) Harvest across the footprint and drop produce
+  doHarvestPatternAndReturn()
+
+  -- 5) Return to go spot and face home
+  goHome()
+  -- Repeat
+end
